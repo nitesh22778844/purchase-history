@@ -111,67 +111,99 @@ def parse_date(raw: str) -> str:
 # Gmail API — authentication and OTP retrieval
 # ---------------------------------------------------------------------------
 
+def _is_server_environment() -> bool:
+    """Detect whether we're running on a headless server (Render, Docker, etc.)."""
+    return os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
+
+
 def get_gmail_service(login_hint: str = ""):
     """
     Return an authenticated Gmail API service object.
 
-    Credentials are read from GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in .env.
-    On first run a browser opens at http://localhost:3000 for OAuth consent and
-    token.json is saved.  Subsequent runs refresh the token silently.
-
-    login_hint: pre-selects the Google account in the consent screen (avoids
-                the "wrong account" problem when multiple accounts are signed in).
+    Auth resolution order:
+      1. Load token.json if present → if expired, refresh via refresh_token
+      2. If no valid token and we're NOT on a server, run interactive OAuth flow
+      3. If no valid token and we ARE on a server, fail with a clear error
+         (servers cannot open browsers; the GMAIL_TOKEN_JSON env var must be set)
     """
     creds = None
 
+    # Step 1: try loading from token.json
     if GMAIL_TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(GMAIL_TOKEN_FILE), GMAIL_SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(GMAIL_TOKEN_FILE), GMAIL_SCOPES)
+            print(f"[gmail] Loaded credentials from {GMAIL_TOKEN_FILE.name}.")
+        except Exception as exc:
+            print(f"[gmail] Could not parse {GMAIL_TOKEN_FILE.name}: {exc}")
+            creds = None
+    else:
+        print(f"[gmail] {GMAIL_TOKEN_FILE.name} not found.")
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print("[gmail] Refreshing Gmail OAuth token…")
+    # Step 2: refresh expired access token if we have a refresh_token
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            print("[gmail] Access token expired — refreshing…")
             creds.refresh(Request())
-        else:
-            client_id = os.getenv("GMAIL_CLIENT_ID", "").strip()
-            client_secret = os.getenv("GMAIL_CLIENT_SECRET", "").strip()
+            GMAIL_TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+            print("[gmail] Token refreshed and saved.")
+        except Exception as exc:
+            print(f"[gmail] Token refresh failed: {exc}")
+            creds = None
 
-            if not client_id or not client_secret:
-                print(
-                    "\n[error] GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be set in .env\n\n"
-                    "  How to get them:\n"
-                    "  1. https://console.cloud.google.com → select your project\n"
-                    "  2. APIs & Services → Credentials\n"
-                    "  3. Find your OAuth 2.0 Client ID → click the pencil/edit icon\n"
-                    "  4. Copy 'Client ID' and 'Client secret' into .env\n"
-                )
-                sys.exit(1)
+    # Done — we have valid creds
+    if creds and creds.valid:
+        return build("gmail", "v1", credentials=creds)
 
-            # Desktop app client — Google automatically allows any http://localhost:{port}
-            # so no redirect URI needs to be registered in Cloud Console.
-            client_config = {
-                "installed": {
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "redirect_uris": ["http://localhost"],
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                }
-            }
+    # Step 3: no valid creds. On a server we cannot open a browser, so bail out clearly.
+    if _is_server_environment():
+        print(
+            "\n[error] Gmail credentials missing or invalid, and the server cannot open a browser.\n"
+            "  This usually means the GMAIL_TOKEN_JSON environment variable is not set or is malformed.\n\n"
+            "  How to fix:\n"
+            "    1. On your local machine, run:  python test_gmail_auth.py\n"
+            "       (This produces a valid token.json after one-time browser consent.)\n"
+            "    2. Open token.json and copy its ENTIRE contents (including the { } braces).\n"
+            "    3. On Render → Service → Environment → set GMAIL_TOKEN_JSON to that value.\n"
+            "    4. Restart / redeploy the service.\n"
+        )
+        raise RuntimeError(
+            "Gmail OAuth cannot run on a headless server. "
+            "Set the GMAIL_TOKEN_JSON env var with a valid token.json content."
+        )
 
-            print(
-                f"[gmail] Opening browser for Gmail OAuth consent (one-time setup)…\n"
-                f"        Account: {login_hint or '(not specified)'}"
-            )
-            flow = InstalledAppFlow.from_client_config(client_config, GMAIL_SCOPES)
-            # port=0 → OS picks any free port; no registration required for Desktop apps
-            creds = flow.run_local_server(
-                port=0,
-                login_hint=login_hint or None,
-            )
+    # Local mode — run interactive OAuth flow
+    client_id = os.getenv("GMAIL_CLIENT_ID", "").strip()
+    client_secret = os.getenv("GMAIL_CLIENT_SECRET", "").strip()
 
-        GMAIL_TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-        print("[gmail] OAuth token saved to token.json.")
+    if not client_id or not client_secret:
+        print(
+            "\n[error] GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be set in .env\n\n"
+            "  How to get them:\n"
+            "  1. https://console.cloud.google.com → select your project\n"
+            "  2. APIs & Services → Credentials\n"
+            "  3. Find your OAuth 2.0 Client ID → click the pencil/edit icon\n"
+            "  4. Copy 'Client ID' and 'Client secret' into .env\n"
+        )
+        sys.exit(1)
 
+    client_config = {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uris": ["http://localhost"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+
+    print(
+        f"[gmail] Opening browser for Gmail OAuth consent (one-time setup)…\n"
+        f"        Account: {login_hint or '(not specified)'}"
+    )
+    flow = InstalledAppFlow.from_client_config(client_config, GMAIL_SCOPES)
+    creds = flow.run_local_server(port=0, login_hint=login_hint or None)
+    GMAIL_TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+    print("[gmail] OAuth token saved to token.json.")
     return build("gmail", "v1", credentials=creds)
 
 
@@ -424,16 +456,10 @@ async def login(page, flipkart_email: str, gmail_service) -> None:
             print(f"    #{i}: {info}")
         sys.exit(1)
 
-    # Snapshot of login form before typing — proves the form was found
-    await page.screenshot(path="step1_login_form.png")
-    print(f"[debug] Screenshot: step1_login_form.png ({Path('step1_login_form.png').resolve()})")
-
     # Enter email
     username_input = page.locator(SELECTORS["username_input"]).first
     await username_input.fill(flipkart_email)
     print("[auth] Email entered.")
-    await page.screenshot(path="step2_email_entered.png")
-    print(f"[debug] Screenshot: step2_email_entered.png")
 
     # Timestamp just before OTP request — filters out any older Flipkart emails
     otp_request_at = int(datetime.now(tz=timezone.utc).timestamp()) - 30
@@ -441,15 +467,9 @@ async def login(page, flipkart_email: str, gmail_service) -> None:
     # Click "Request OTP"
     otp_btn = page.locator(SELECTORS["request_otp_button"]).first
     await otp_btn.wait_for(state="visible", timeout=8_000)
-    otp_btn_text = (await otp_btn.inner_text()).strip()
-    print(f"[debug] Clicking button with text: '{otp_btn_text}'")
     await otp_btn.click()
     await page.wait_for_timeout(3_000)
     print("[auth] OTP requested from Flipkart.")
-    await page.screenshot(path="step3_after_otp_click.png")
-    print(f"[debug] Screenshot AFTER OTP click: step3_after_otp_click.png")
-    print(f"[debug] Current URL: {page.url}")
-    print(f"[debug] Page title: {await page.title()}")
 
     # Fetch OTP via Gmail API in a background thread
     otp = await asyncio.to_thread(
@@ -511,28 +531,6 @@ async def scroll_until_n_orders(page, n: int) -> list:
         await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
         await page.wait_for_timeout(1_800)
     return await page.query_selector_all(SELECTORS["order_card"])
-
-
-async def extract_date_from_card(card) -> str:
-    try:
-        date_el = await card.query_selector(
-            "span:has-text('Delivered'), span:has-text('Order'), "
-            "div:has-text('Ordered on'), div:has-text('Order placed'), "
-            "[class*='_3XGuOJ'], [class*='_2JC35k']"
-        )
-        if date_el:
-            return parse_date(await date_el.inner_text())
-        full_text = await card.inner_text()
-        m = re.search(
-            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}[,\s']+\d{2,4}|"
-            r"\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}",
-            full_text, re.I,
-        )
-        if m:
-            return parse_date(m.group(0))
-    except Exception:
-        pass
-    return "unknown"
 
 
 def _clean_product_title(raw: str) -> str:
@@ -767,6 +765,14 @@ async def run(num_orders: int, headless: bool) -> None:
     for i, p in enumerate(report_products, 1):
         title = p["title"][:58] + ".." if len(p["title"]) > 60 else p["title"]
         print(f"{i:<4}  {title:<60}  {p['purchase_date']:<12}  {p['purchase_count_in_last_10_orders']}")
+
+    # ---- Push to Salesforce ----
+    # Best-effort: any failure here is logged but does not fail the scrape.
+    try:
+        from salesforce_sync import sync_products
+        sync_products(report_products)
+    except Exception as exc:
+        print(f"[salesforce] Sync failed: {exc}")
 
 
 def main() -> None:
