@@ -58,12 +58,12 @@ SELECTORS = {
         "a:has-text('My Account'), span:has-text('Account'), "
         "[class*='account'][href*='wishlist'], [class*='profileIcon']"
     ),
-    # Flipkart: orders page — each order is a div.HetYBQ inside div.allJIf
-    "order_card": (
-        "div.HetYBQ, "
-        "div:has(> div > div > a[href*='order_details']), "
-        "div:has(> div > a[href*='order_details'])"
-    ),
+    # Flipkart: orders page — outer wrapper used by BOTH regular orders and
+    # Flipkart Minutes Basket cards. Regular orders contain /order_details
+    # anchors directly; Minutes Basket cards have no anchors and must be
+    # clicked to open their detail page (URL includes &grocery=true).
+    # TODO: replace hashed class if Flipkart changes it
+    "order_card": "div.ZcgLRi",
 }
 
 # ---------------------------------------------------------------------------
@@ -93,8 +93,16 @@ def parse_date(raw: str) -> str:
         return "unknown"
     cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw)
     cleaned = re.sub(r"'(\d{2})\b", lambda m: f"20{m.group(1)}", cleaned)
+    # Flipkart anchor text shows "Delivered on Apr 06" — no year. If dateutil
+    # has to fall back to its default (current year), the date can land in the
+    # future for orders that actually happened last year. Detect a missing
+    # year ourselves and roll back 12 months when needed.
+    has_year = bool(re.search(r"\b(19|20)\d{2}\b", cleaned))
     try:
-        return dateutil_parser.parse(cleaned, fuzzy=True).date().isoformat()
+        parsed = dateutil_parser.parse(cleaned, fuzzy=True).date()
+        if not has_year and parsed > datetime.now(tz=timezone.utc).date():
+            parsed = parsed.replace(year=parsed.year - 1)
+        return parsed.isoformat()
     except Exception:
         m = re.search(r"\d{4}-\d{2}-\d{2}", raw)
         if m:
@@ -548,15 +556,107 @@ def _clean_product_title(raw: str) -> str:
 
 
 def _extract_date_from_text(text: str) -> str:
-    """Find a 'Delivered/Ordered/Shipped on <Date>' inside text → ISO YYYY-MM-DD."""
+    """Find a 'Delivered/Ordered/Shipped on <Date>' inside text → ISO YYYY-MM-DD.
+    The year is optional — Flipkart anchor text often shows just 'Apr 06'."""
     m = re.search(
         r"(?:Delivered|Ordered|Shipped|Cancelled|Return\s+completed|Refund\s+completed)"
-        r"\s+on\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})",
+        r"\s+on\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,?\s+\d{2,4})?)",
         text, re.I,
     )
     if m:
         return parse_date(m.group(1))
     return "unknown"
+
+
+def _clean_minutes_product_title(raw: str) -> str:
+    """Strip price + status suffix from Minutes Basket modal item text.
+    e.g. 'Nandini Curd Plain Curd ₹26.0 Return policy ended' → 'Nandini Curd Plain Curd'."""
+    # Cut at first ₹ price
+    t = re.split(r"\s*₹", raw, maxsplit=1)[0]
+    # Strip trailing status keywords that may appear before the price
+    t = re.sub(
+        r"\s+(Return|Cancel|Refund|Replace|Rate\s+&\s+Review).*$", "",
+        t, flags=re.I,
+    )
+    return re.sub(r"\s+", " ", t).strip()
+
+
+async def scrape_minutes_basket(page, card, order_idx: int, total: int) -> list[dict]:
+    """For a Flipkart Minutes Basket card: click into the detail page, expand
+    'See all items', extract product titles + order date, then go back to the
+    orders list."""
+    card_text = (await card.inner_text()) or ""
+    fallback_date = _extract_date_from_text(card_text)
+
+    await card.scroll_into_view_if_needed()
+    await card.click()
+
+    try:
+        await page.wait_for_url(re.compile(r"order_details.*grocery=true"), timeout=15_000)
+    except PlaywrightTimeoutError:
+        print(f"[order {order_idx}/{total}] Minutes detail page did not open; skipping.")
+        return []
+
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(800)
+
+    detail_text = (await page.locator("body").inner_text()) or ""
+    m = re.search(
+        r"Order\s+Date\s+([A-Za-z]{3,9}\s+\d{1,2},?\s*\d{2,4})",
+        detail_text, re.I,
+    )
+    order_date = parse_date(m.group(1)) if m else fallback_date
+
+    try:
+        see_all = page.get_by_text(re.compile(r"(see|view)\s+all\s+items", re.I)).first
+        await see_all.wait_for(state="visible", timeout=8_000)
+        await see_all.click()
+        await page.wait_for_timeout(1_500)
+        await page.wait_for_load_state("networkidle")
+    except PlaywrightTimeoutError:
+        print(f"[order {order_idx}/{total}] 'See all items' not visible — using visible items.")
+
+    items = await page.evaluate(r"""
+        () => {
+          const imgs = Array.from(document.querySelectorAll(
+            'img[src*="rukmini"]:not([src*="promos"]):not([src*="logos"]):not([src*="banner"])'
+          ));
+          const out = [];
+          for (const img of imgs) {
+            let cur = img;
+            for (let i = 0; i < 10 && cur; i++) {
+              const t = (cur.innerText || '').replace(/\s+/g,' ').trim();
+              if (t.length > 5 && t.length < 400 && t.includes('₹')) {
+                out.push({ text: t, src: img.src });
+                break;
+              }
+              cur = cur.parentElement;
+            }
+          }
+          return out;
+        }
+    """)
+
+    products: list[dict] = []
+    seen: set[str] = set()
+    for it in items:
+        title = _clean_minutes_product_title(it["text"])
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        products.append({
+            "item_id": f"minutes::{order_idx}::{title.lower()}",
+            "title": title,
+            "date": order_date,
+        })
+
+    print(f"[order {order_idx}/{total}] Minutes Basket: {len(products)} product(s)")
+
+    await page.go_back()
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1_500)
+
+    return products
 
 
 async def expand_and_get_products(page, card, order_idx: int, total: int) -> list[dict]:
@@ -579,6 +679,16 @@ async def expand_and_get_products(page, card, order_idx: int, total: int) -> lis
 
         if title:
             products.append({"item_id": item_id, "title": title, "date": date})
+
+    # Refunded / cancelled sub-items have no date in their anchor text. Fall
+    # back to any sibling's date in the same order card, then to the card text.
+    fallback = next((p["date"] for p in products if p["date"] != "unknown"), "unknown")
+    if fallback == "unknown":
+        fallback = _extract_date_from_text((await card.inner_text()) or "")
+    if fallback != "unknown":
+        for p in products:
+            if p["date"] == "unknown":
+                p["date"] = fallback
 
     print(f"[order {order_idx}/{total}] {len(products)} product(s)")
     return products
@@ -724,11 +834,29 @@ async def run(num_orders: int, headless: bool) -> None:
         # ---- Extract products, deduped globally by item_id ----
         # Flipkart's orders page sometimes shows the same items in multiple cards
         # (e.g. "All items" summary panels). Dedupe so each purchase is counted once.
+        # Re-query cards each iteration because Minutes Basket scraping navigates
+        # away and back, which detaches any previously captured ElementHandles.
         all_products: list[dict] = []
         seen_item_ids_global: set[str] = set()
-        for idx, card in enumerate(cards, start=1):
+        for idx in range(1, actual_count + 1):
             try:
-                products = await expand_and_get_products(page, card, idx, actual_count)
+                # Re-scroll after every Minutes back-navigation, which often
+                # leaves the orders page with only the top few cards rendered.
+                fresh_cards = await page.query_selector_all(SELECTORS["order_card"])
+                if idx - 1 >= len(fresh_cards):
+                    await scroll_until_n_orders(page, idx)
+                    fresh_cards = await page.query_selector_all(SELECTORS["order_card"])
+                if idx - 1 >= len(fresh_cards):
+                    print(f"[order {idx}/{actual_count}] Card index out of range after reload; stopping.")
+                    break
+                card = fresh_cards[idx - 1]
+                card_text = (await card.inner_text()) or ""
+
+                if re.search(r"minutes\s*basket", card_text, re.I):
+                    products = await scrape_minutes_basket(page, card, idx, actual_count)
+                else:
+                    products = await expand_and_get_products(page, card, idx, actual_count)
+
                 for p in products:
                     if p["item_id"] in seen_item_ids_global:
                         continue

@@ -3,9 +3,11 @@ Flask web service wrapping the Flipkart scraper.
 Render (and any cloud platform) needs an HTTP port — this provides it.
 
 Endpoints:
-  GET  /health   → liveness check
-  POST /scrape   → start a scrape (runs in background thread)
-  GET  /results  → return the latest scrape output
+  GET  /health         → liveness check
+  GET  /docs           → Swagger UI playground
+  GET  /openapi.json   → OpenAPI 3.0 spec
+  GET  /api/products   → latest scrape output ({product_name, date, number_of_times_purchased})
+  POST /api/products   → start a scrape in a background thread (body: {"orders": <int>})
 """
 
 import asyncio
