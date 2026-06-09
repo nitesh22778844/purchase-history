@@ -121,6 +121,11 @@ def mask(value: str) -> str:
     return f"***{value[-4:]}" if value and len(value) > 4 else "****"
 
 
+def _today_iso() -> str:
+    """Local-date ISO string (YYYY-MM-DD) for 'Delivered Today' orders."""
+    return datetime.now(tz=timezone.utc).astimezone().date().isoformat()
+
+
 def parse_date(raw: str) -> str:
     if not raw:
         return "unknown"
@@ -608,7 +613,7 @@ def _clean_product_title(raw: str) -> str:
     title = re.sub(r"^[^.]+? shared this order with you\.\s*", "", raw, flags=re.I)
     # Cut at first occurrence of any of: Color:, Size:, ₹, +<digits>, Delivered, Refund, Return, Cancelled
     title = re.split(
-        r"\s*(?:Color:|Size:|₹|\+\d+|Delivered\s+on|Refund|Return\s|Cancelled|Your\s+item)",
+        r"\s*(?:Color:|Size:|₹|\+\d+|Delivered\s+(?:on|Today)|Refund|Return\s|Cancelled|Your\s+item)",
         title, maxsplit=1, flags=re.I,
     )[0]
     title = re.sub(r"\s+", " ", title).strip()
@@ -620,6 +625,9 @@ def _clean_product_title(raw: str) -> str:
 def _extract_date_from_text(text: str) -> str:
     """Find a 'Delivered/Ordered/Shipped on <Date>' inside text → ISO YYYY-MM-DD.
     The year is optional — Flipkart anchor text often shows just 'Apr 06'."""
+    # Same-day orders render as "Delivered Today" (no explicit date) — map to today.
+    if re.search(r"Delivered\s+Today\b", text, re.I):
+        return _today_iso()
     m = re.search(
         r"(?:Delivered|Ordered|Shipped|Cancelled|Return\s+completed|Refund\s+completed)"
         r"\s+on\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,?\s+\d{2,4})?)",

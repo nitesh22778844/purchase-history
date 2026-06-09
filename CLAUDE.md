@@ -317,3 +317,51 @@ Container starts
 - No scraping beyond the 10 most recent orders unless `--orders` is explicitly raised.
 - No creation of new Salesforce records — sync only updates titles that already exist.
 - No multi-user support — the service is single-tenant (one Flipkart account).
+
+## Running Locally on macOS (zsh)
+
+The "Running Locally" section above uses PowerShell. On macOS/Linux the venv
+lives at `.venv/bin/python` and env vars are set inline before the command.
+
+### One-time setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+```
+
+Copy `.env.example` to `.env` and fill in `FLIPKART_USERNAME`,
+`GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`. Run `python test_gmail_auth.py` once
+to complete the Gmail OAuth consent (produces `token.json`).
+
+### Start the web service
+
+```bash
+# Headed browser, server on http://localhost:3000
+PORT=3000 HEADLESS=false .venv/bin/python app.py
+```
+
+Then open **http://localhost:3000/docs** for the interactive Swagger UI (the
+`/` route redirects there). Default port is `10000` if `PORT` is unset.
+
+```bash
+# Trigger a scrape (runs in a background thread)
+curl -X POST http://localhost:3000/api/products \
+  -H "Content-Type: application/json" -d '{"orders": 10}'
+
+# Poll for results (scrape takes ~2–5 minutes)
+curl http://localhost:3000/api/products
+```
+
+### Run the scraper / tools directly (without Flask)
+
+```bash
+.venv/bin/python scrape_flipkart_orders.py              # headed, 10 orders
+.venv/bin/python scrape_flipkart_orders.py --orders=5
+.venv/bin/python scrape_flipkart_orders.py --headed=false   # headless
+.venv/bin/python flipkart_minutes_cart.py "Amul Gold Milk" "Tata Salt"
+.venv/bin/python salesforce_sync.py                     # re-sync orders_report.json
+.venv/bin/python -m unittest test_units.py -v           # offline unit tests
+```

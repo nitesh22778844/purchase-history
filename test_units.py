@@ -319,6 +319,12 @@ class CleanProductTitleTests(unittest.TestCase):
             "Nike Shoes",
         )
 
+    def test_truncates_at_delivered_today(self):
+        self.assertEqual(
+            sfo._clean_product_title("Nike Shoes Delivered Today"),
+            "Nike Shoes",
+        )
+
     def test_drops_trailing_ellipsis(self):
         self.assertEqual(sfo._clean_product_title("Boat Airdopes…"), "Boat Airdopes")
 
@@ -338,6 +344,13 @@ class ExtractDateFromTextTests(unittest.TestCase):
         self.assertEqual(
             sfo._extract_date_from_text("Delivered on Apr 12, 2026"),
             "2026-04-12",
+        )
+
+    def test_delivered_today_maps_to_today(self):
+        expected = datetime.now(tz=timezone.utc).astimezone().date().isoformat()
+        self.assertEqual(
+            sfo._extract_date_from_text("Boat Airdopes Delivered Today"),
+            expected,
         )
 
     def test_no_date_returns_unknown(self):
